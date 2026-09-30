@@ -64,11 +64,18 @@ if [[ -n "$_pyver" ]]; then
   _an="$HOME/.cache/Huawei/DevEcoStudio26.0/caches/appanalyzer"
   _req_dir="$_an/pythonconfig/requirements"
   _req_file="$_req_dir/python_$_pyver/requirements.json"
-  mkdir -p "$_req_dir"
+  mkdir -p "$_req_dir/python_$_pyver"
   ln -sfn "python_$_pyver" "$_req_dir/Python_$_pyver"
   if [[ ! -s "$_req_file" ]]; then
-    unzip -p "/opt/devecostudio/plugins/app-analyzer/lib/hos-app-analyzer-26.0.0.821.jar" \
-      "python/${_pyver%.*}/requirements_external.json" > "$_req_file" 2>/dev/null
+    # The jar name carries the DevEco version, so glob it: a hardcoded
+    # 26.0.0.821 name silently seeded a 0-byte file on 26.0.0.851 (and
+    # would keep retrying and failing forever). Write via a temp file so a
+    # failed extraction never leaves an empty file behind.
+    _jar=$(ls /opt/devecostudio/plugins/app-analyzer/lib/hos-app-analyzer-[0-9]*.jar 2>/dev/null | head -1)
+    if [[ -n "$_jar" ]]; then
+      unzip -p "$_jar" "python/${_pyver%.*}/requirements_external.json" > "$_req_file.tmp" 2>/dev/null \
+        && mv "$_req_file.tmp" "$_req_file" || rm -f "$_req_file.tmp"
+    fi
   fi
   "$_pybin/python3" - "$_req_file" << 'PYEOF'
 import json, os, sys

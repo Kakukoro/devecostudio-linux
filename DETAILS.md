@@ -360,6 +360,17 @@ tests) treat these as the same file; Linux does not, so the read fails,
 symlink (`Python_<ver> → python_<ver>`) and seeds `requirements.json` from
 the jar's `python/3.12/requirements_external.json` when missing.
 
+The seeding jar's filename carries the DevEco version
+(`hos-app-analyzer-<pkgver>.jar`), so the launcher **globs** it
+(`hos-app-analyzer-[0-9]*.jar`) rather than naming it — a hardcoded
+`…-26.0.0.821.jar` silently seeded a **0-byte** file on 26.0.0.851 (the
+rename to `-26.0.0.851.jar`), and because the check is `[[ ! -s ]]` it then
+retried and failed on every launch. The seed now also writes to a temp file
+and only `mv`s on success, so a failed extraction leaves nothing behind,
+and it creates the `python_<ver>/` directory itself (Huawei normally does,
+but the wrapper runs before appanalyzer's first launch too, and a missing
+directory used to spam a redirect error on every start).
+
 ### appanalyzer torch scenario
 
 Torch-related analysis works, with two upstream bugs worked around: (1) the
