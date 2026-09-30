@@ -498,10 +498,13 @@ The patches:
   26.0.0.621, 26.0.0.821 and 26.0.0.851), so the error notification is
   never reached.
 
-All patches are idempotent. Backup of the pristine hvigor file:
-`hvigor-patch-backup/validate-util.js.orig-26.0.0` in the repo root. The
-string patterns and the jar byte sequence were re-verified on 26.0.0.851
-(hvigor 6.26.8) — unchanged from 6.26.4.
+All patches are idempotent and pattern-matched, so they keep no backup
+files — an earlier pair of `.orig` dumps under `hvigor-patch-backup/`
+(workspace root, never committed) has been dropped. The string patterns
+and the jar byte sequence were re-verified on 26.0.0.851 (hvigor 6.26.8) —
+unchanged from 6.26.4. A miss only warns; if you need the pristine file
+again, take it from the CLI zip
+(`command-line-tools/hvigor/hvigor-ohos-plugin/src/...`).
 
 The extra SDK is extracted with **bsdtar/unzip, not 7z**: 7z refuses the
 SDK's symlink chains (`libunwind.so → libunwind.so.1`, `clang →
