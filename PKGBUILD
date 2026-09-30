@@ -15,9 +15,9 @@
 
 pkgname=devecostudio
 pkgdesc='Huawei DevEco Studio repackaged for Arch Linux'
-pkgver=26.0.0.821
+pkgver=26.0.0.851
 _ideaver=2026.1.3
-pkgrel=2
+pkgrel=1
 # ── CLI tool exposure ──
 # The bundled Huawei CLI tools (hvigorw, ohpm, hstack, codelinter, Emulator)
 # live under /opt/devecostudio/tools/bin/. Set _expose_cli_tools=false to
@@ -31,10 +31,15 @@ _hprefix_generic_tools=true
 _shared_scripts=(
   'devecostudio.sh'
   'install-extra-sdk.sh'
+  'patch-extra-sdk.sh'
+  'patch-previewer.py'
   'emulator-wrapper-patch.sh'
   'python3-wrapper'
   'append.vmoptions'
 )
+# Re-applies the extra-SDK patches after an install/upgrade (an upgrade
+# restores the pristine hvigor/IDE files); a no-op without an extra SDK.
+install=devecostudio.install
 arch=('x86_64')
 url='https://developer.huawei.com/consumer/cn/deveco-studio/'
 license=('custom:Commercial')
@@ -60,8 +65,8 @@ source=(
   "cpython-3.12.10+20250409-x86_64-unknown-linux-gnu-install_only.tar.gz::https://github.com/astral-sh/python-build-standalone/releases/download/20250409/cpython-3.12.10+20250409-x86_64-unknown-linux-gnu-install_only.tar.gz"
 )
 sha256sums=(
-  '738195cabf9777db0e5aeee5096ea7ed3f1f78db0f31c3c25ae09adfc93bea8a'
-  '58da7359019e9360a8bb82da0cd1d3b3b26fedc338379f257849f2162e3ac1fc'
+  'ad7f7100b3d95bacfa1b803ad1026c1e3b0f23cbb61c868f5684fbaa5b3772d8'
+  'ab604bd92721d5cbcafd154e6461d46b9f1b105e7b89eab04a9d046681198082'
   'a6f049716da1d09d9e0ec1500c60bf01a5ff8a0fe2419178dd1ff2fdb2b77563'
   'b530705424c7fdd61c3eaa477d6c79643e5d9d0cf7ecadc8f6e96559b7c6dc2d'
   'e9cf6f7da499a4400ba30ae1da8f7ef25ce97827bd8c1084717aa05438035186'
@@ -123,7 +128,7 @@ package() {
   local _idea=$(find "$srcdir" -mindepth 1 -maxdepth 1 -type d -name 'idea-IU-*' | head -1)
   local _cli="$srcdir/command-line-tools"
   local _pkg="$pkgdir/opt/devecostudio"
-  local _scripts=(devecostudio.sh install-extra-sdk.sh emulator-wrapper-patch.sh python3-wrapper append.vmoptions)
+  local _scripts=(devecostudio.sh install-extra-sdk.sh patch-extra-sdk.sh patch-previewer.py emulator-wrapper-patch.sh python3-wrapper append.vmoptions)
   for _s in "${_scripts[@]}"; do
     if [[ ! -f "$startdir/scripts/$_s" ]]; then
       error "missing shared script: scripts/$_s (edit/commit scripts/ and rebuild)"
@@ -198,9 +203,22 @@ package() {
   # SDK. hvigor picks the SDK by the project's compileSdkVersion, so projects
   # can build against either. Installing an *older* SDK also patches hvigor
   # and the IDE sync check, because both are hardwired to the bundled SDK
-  # version. Not symlinked into /usr/bin on purpose.
+  # version (patch-extra-sdk.sh does the work; devecostudio.install re-runs
+  # it automatically after an upgrade). Not symlinked into /usr/bin.
   cat "$startdir/scripts/install-extra-sdk.sh" > "$_pkg/bin/install-extra-sdk.sh"
   chmod +x "$_pkg/bin/install-extra-sdk.sh"
+  cat "$startdir/scripts/patch-extra-sdk.sh" > "$_pkg/bin/patch-extra-sdk.sh"
+  chmod +x "$_pkg/bin/patch-extra-sdk.sh"
+
+  msg2 "Patching the local unit-test driver (fail fast instead of hanging)..."
+  # Huawei's driver resolves the test task only on a stdout completion
+  # marker: the child's exit code and stderr are ignored and there is no
+  # timeout. On Linux the SDK Previewer can never complete a run (its -d
+  # entry point is a compile-time stub that reports "Linux is not
+  # supported"), so `hvigorw test` hung forever with no output at all.
+  # The success path is left untouched.
+  python3 "$startdir/scripts/patch-previewer.py" \
+    "$_pkg/tools/hvigor/hvigor-ohos-plugin/node_modules/@ohos/coverage/lib/src/commandLine/localTest/previewer.js"
 
   msg2 "Transforming vmoptions (macOS → Linux)..."
   sed \
@@ -392,8 +410,14 @@ PYEOF
   # SDK (lldb launchers, cmake modules, build helpers)
   find "$_pkg/bin" "$_pkg/tools/bin" -name '*.sh' \
     -not -path '*/bin/devecostudio.sh' \
-    -not -path '*/bin/install-extra-sdk.sh' -delete 2>/dev/null || true
+    -not -path '*/bin/install-extra-sdk.sh' \
+    -not -path '*/bin/patch-extra-sdk.sh' -delete 2>/dev/null || true
   find "$_pkg/plugins" -name '*.sh' -delete 2>/dev/null || true
+  # Guard: the cleanup above matches by name and has silently eaten our own
+  # bin/*.sh scripts twice — fail the build instead of shipping them missing.
+  for _s in devecostudio.sh install-extra-sdk.sh patch-extra-sdk.sh; do
+    [[ -f "$_pkg/bin/$_s" ]] || { error "$_pkg/bin/$_s was deleted by the cleanup pass"; exit 1; }
+  done
 
   # ── Desktop entry & symlink ──
   install -Dm644 "$srcdir/devecostudio.desktop" "$pkgdir/usr/share/applications/devecostudio.desktop"

@@ -116,6 +116,51 @@ fails to load `libshared_libz.so` / `libhilog.so` — the CLI ships
 `libhilog_linux.so` and no zlib shim — but adding those only gets the
 engine to the point where it prints "Linux is not supported".)
 
+### `hvigorw test` hung forever (fixed in the package)
+
+`hvigorw test` (local unit tests) never finished: it printed
+`Finished :entry:default@UnitTestArkTS` and then nothing, forever. The
+cause is hvigor's test driver, not our packaging —
+`tools/hvigor/hvigor-ohos-plugin/node_modules/@ohos/coverage/lib/src/commandLine/localTest/previewer.js`,
+`executeCoverageTest()`:
+
+- it resolves its promise **only** when the Previewer prints a completion
+  marker on stdout (`OHOS_REPORT_STATUS: taskconsuming`,
+  `The AbilityDelegator.finishTest`, …) —
+  `isShouldKillPreviewer()`'s first check is the constant
+  `'[Engine Log]Error message:'`, which the stub's line does not match;
+- `child.on('close')` only deletes the port — it never rejects;
+- `stderr` is never read and there is no timeout.
+
+On Linux the Previewer can never produce a marker (it dies on the missing
+`libshared_libz.so`, or, with the libraries supplied, prints
+`Linux is not supported` and returns **without exiting**), so the promise
+never settles and hvigor waits silently.
+
+`scripts/patch-previewer.py` (run from `package()`, so every build since
+26.0.0.851-2 carries it) leaves the success path untouched and adds only
+failure paths: child exit → reject, spawn failure → reject, stderr
+forwarded to the logger, the `Linux is not supported` line → reject with an
+actionable message, plus a `DEVECO_PREVIEWER_TIMEOUT_MS` backstop
+(default 120 s). The `error`/`close`-only fix would still wait for the
+timeout; the marker check is what makes it instant.
+
+Measured by calling `executeCoverageTest()` directly with the real `.test`
+artifacts of a project:
+
+| scenario | result |
+|---|---|
+| Previewer missing a shared library (exit 127) | **0.24 s**, rejects; the loader error is now visible (it used to be swallowed) |
+| libraries supplied → `Linux is not supported` | **0.69 s**, rejects with the "run instrumented tests instead" hint |
+
+Trap found while verifying: the first version of the patch rejected
+without `child.kill()`/`unref()`. The marker fired immediately, but the
+orphaned Previewer kept Node's event loop alive, so the run still took the
+full 120 s. `_prevFail()` now kills and unrefs the child.
+
+A pattern miss only warns (upstream may reshape the file) — re-verify on
+every new hvigor.
+
 ### Node.js layout (three symlinks, no real-file copy)
 
 The CLI's `tool/node/` is the upstream node tarball layout: real binaries
@@ -384,8 +429,8 @@ codelinter's (`$ROOT_DIR/tool/node` → `$ROOT_DIR/node`, `$ROOT_DIR/sdk` →
 ### Dual SDK: 26.0.0 vs older (6.1.1 etc.)
 
 DevEco 26.0.0 shipped SDK components as Beta2 (`releaseType: Beta2`,
-26.0.0.32), so built artifacts declared `Beta2`. 26.0.0.821 (the current
-pkgver) ships a **Release** SDK (26.0.0.105) — the default install now
+26.0.0.32), so built artifacts declared `Beta2`. From 26.0.0.821 on, the
+bundled SDK is a **Release** one (26.0.0.105) — the default install
 produces `Release` artifacts and needs no patches. The extra-SDK machinery
 remains for older SDKs (e.g. 6.1.1 Release), switchable per project via
 `compileSdkVersion`.
@@ -420,8 +465,27 @@ remains for older SDKs (e.g. 6.1.1 Release), switchable per project via
    with `SyncInterruptException` otherwise.
 
 All three checks are hardwired to the bundled SDK version, so **no patch is
-applied by default** — `bin/install-extra-sdk.sh` applies them when it
-installs an older SDK:
+applied by default**. They live in `bin/patch-extra-sdk.sh` (idempotent,
+self-elevating via `sudo`), which is invoked from two places:
+
+- `bin/install-extra-sdk.sh`, right after it installs an older SDK;
+- `devecostudio.install` (`post_install`/`post_upgrade`) with `--auto`, and
+  the nfpm `scripts/postinstall.sh` for the deb/rpm builds. An upgrade
+  restores the pristine hvigor/IDE files, so without this a user's older-SDK
+  projects would silently stop syncing until they re-ran the installer by
+  hand.
+
+`--auto` no-ops unless an extra SDK is really installed: a directory under
+`/opt/devecostudio/sdk/` other than `default/` that contains both
+`sdk-pkg.json` **and** `openharmony/` (that predicate ignores leftover
+metadata-only backup dirs).
+
+The Python in both scripts is the one **inside the package**
+(`plugins/app-analyzer/lib/python/bin/python3.12`) — `python` is only a
+`makedepends`, and `.install` hooks run in a minimal environment where
+`python3` may not even be on `PATH`.
+
+The patches:
 
 - hvigor (`validate-util.js`): Python string replacement turning the
   `printErrorExit` into `||void 0`
@@ -431,10 +495,13 @@ installs an older SDK:
 - IDE jar: single-byte patch in `HosIntegrationChecker.class` — the `ifne`
   after `StringUtil.equals()` becomes `goto` (byte sequence
   `b8 00 ad 9a 00 0b` → `b8 00 ad a7 00 0b`, verified identical in
-  26.0.0.621 and 26.0.0.821), so the error notification is never reached.
+  26.0.0.621, 26.0.0.821 and 26.0.0.851), so the error notification is
+  never reached.
 
 All patches are idempotent. Backup of the pristine hvigor file:
-`hvigor-patch-backup/validate-util.js.orig-26.0.0` in the repo root.
+`hvigor-patch-backup/validate-util.js.orig-26.0.0` in the repo root. The
+string patterns and the jar byte sequence were re-verified on 26.0.0.851
+(hvigor 6.26.8) — unchanged from 6.26.4.
 
 The extra SDK is extracted with **bsdtar/unzip, not 7z**: 7z refuses the
 SDK's symlink chains (`libunwind.so → libunwind.so.1`, `clang →
@@ -454,11 +521,12 @@ artifact's `releaseType` follows the *selected SDK's own* metadata
 PATH): extracts `sdk/default/{openharmony,hms,sdk-pkg.json}` from a Huawei
 commandline-tools zip, reads the SDK's `data.path` (e.g. `HarmonyOS-6.1.1`)
 from `sdk-pkg.json` to name the destination directory, copies it under
-`/opt/devecostudio/sdk/<path>` with sudo, then applies the two patches
-above. The directory name comes from the zip, so the same script works for
-any version. After a package upgrade the patches are gone — re-run the
-script (or use `-f`-style reinstall by removing the target first) to
-re-apply.
+`/opt/devecostudio/sdk/<path>` with sudo, then calls
+`bin/patch-extra-sdk.sh`. The directory name comes from the zip, so the
+same script works for any version. If the target directory already exists
+it skips the copy and still runs the patches — that is the intended way to
+re-apply them after an upgrade (it used to `exit 1` there, so the old
+"re-run this script after a package upgrade" note was wrong).
 
 **Verified behavior** (26.0.0.621-9 and 26.0.0.821-1):
 
@@ -525,8 +593,14 @@ are the single source of truth — the PKGBUILD references them via
   JCEF workaround, headless JCEF args, `~/Library/Huawei/Sdk` bridge,
   appanalyzer requirements case-bridge + torchvision seed)
 - `scripts/install-extra-sdk.sh` — the extra-SDK installer (bsdtar/unzip
-  extraction + the three compileSdkVersion patches); installed to
+  extraction, then calls `patch-extra-sdk.sh`); installed to
   `bin/install-extra-sdk.sh`
+- `scripts/patch-extra-sdk.sh` — the three compileSdkVersion patches +
+  the `--auto` detection used by the upgrade hooks; installed to
+  `bin/patch-extra-sdk.sh`
+- `scripts/patch-previewer.py` — build-time patcher for hvigor's local
+  unit-test driver (fail fast instead of hanging); **not** shipped inside
+  the package, it runs from `package()`
 - `scripts/emulator-wrapper-patch.sh` — the license auto-accept block
   `sed`-inserted into the Emulator wrapper
 - `scripts/python3-wrapper` — the pip `--no-deps`/`--no-index` stripping
@@ -576,7 +650,9 @@ What build.sh does beyond makepkg:
   `libXScrnSaver`, `pulseaudio-libs`, `libxcrypt-compat`), `type: tree`
   pulls in the whole `/opt/devecostudio` tree, and the `/usr/bin`
   symlinks are declared individually. `scripts/postinstall.sh` runs
-  `update-desktop-database` for both deb and rpm scriptlets.
+  `update-desktop-database` for both deb and rpm scriptlets **and**
+  `patch-extra-sdk.sh --auto`, so deb/rpm get the same
+  re-apply-the-patches-on-upgrade behaviour as pacman's `devecostudio.install`.
 
 Pitfalls learned:
 
@@ -628,6 +704,13 @@ only download what they need; each is ~3–4 GB:
    and removed `lib/modules` + `lib/cds`, and added
    `lib/skiko-awt-runtime-all` and `tools/dumpParser` (Mach-O, excluded).
 3. Update `pkgver`, `_ideaver`, and the two Huawei zip `sha256sums`.
+   Also confirm the four patch patterns still match — hvigor
+   `validate-util.js`, hvigor `hmos-sdk-loader.js`, the
+   `hos-project-mgmt-*.jar` byte sequence (via
+   `bin/patch-extra-sdk.sh`) and the previewer driver (via
+   `scripts/patch-previewer.py`). All of them warn rather than fail, so
+   read the build output: a silent "pattern not found" means the older-SDK
+   or fail-fast behaviour is gone.
 4. `makepkg -f`, install, and run the test checklist below.
 
 ### Test checklist (after build)
@@ -640,6 +723,10 @@ only download what they need; each is ~3–4 GB:
 - [ ] All five CLI tools: `hvigorw --version`, `ohpm --version`,
       `hstack --version`, `hcodelinter --version`, `hemulator --version`
 - [ ] `hdc list targets` sees a running emulator
+- [ ] `hvigorw test` **fails fast** (seconds, with the "cannot run ArkTS
+      tests on Linux" hint) instead of hanging silently
+- [ ] With an extra SDK present, upgrading re-applies the patches — pacman
+      prints `Extra SDK detected (<name>) — re-applying hvigor/IDE patches`
 
 ### Release
 
@@ -665,6 +752,8 @@ only download what they need; each is ~3–4 GB:
   scan for exec-bit detection.
 - **`ln -sf bin/*` from the wrong cwd** silently creates a broken
   `bin/*` symlink — always `(cd dir && ln -sf ...)`.
-- The `find "$_pkg" -name '*.sh' -delete` blanket rule is a footgun (SDK
-  content) — keep it scoped.
+- The `find "$_pkg/bin" ... -name '*.sh' -delete` cleanup rule is a footgun:
+  it has silently eaten our own `bin/*.sh` twice (`install-extra-sdk.sh`,
+  then `patch-extra-sdk.sh`). Each of our scripts needs an explicit
+  `-not -path`, and `package()` now asserts all three still exist.
 - Wayland: JCEF GPU process crashes; use the X11 workaround.

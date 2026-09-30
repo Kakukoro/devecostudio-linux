@@ -214,8 +214,9 @@ reproducing issues or building against an older API level.
 
 Installing an older SDK also patches two things so it can actually be used:
 hvigor's `compileSdkVersion` validation and the IDE's project-sync check
-(both are hardwired to the bundled SDK version). The patches are applied
-only by `install-extra-sdk.sh` — a default install stays pristine.
+(both are hardwired to the bundled SDK version). A default install stays
+pristine; the patches are applied by `install-extra-sdk.sh` and re-applied
+automatically when the package is upgraded while an extra SDK is present.
 
 Note: source code using API 26-only interfaces (e.g. newer camera APIs)
 will not compile against 6.1.1 — adjust or guard the code accordingly.
@@ -258,6 +259,9 @@ This project provide environment support for DevEco CLI. Simply set `DEVECO_CLI_
 
 The previewer is unavailable. Huawei has not yet ported the Rosen
 rendering engine to Linux.
+
+This also means `hvigorw test` (local unit tests run through the previewer)
+cannot pass. It should fails within seconds.
 
 ## How does this work?
 
